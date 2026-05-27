@@ -340,9 +340,10 @@ function App() {
       try {
         const off = await providersApi.onSwitched(
           async (event: ProviderSwitchEvent) => {
-            if (event.appType === activeApp) {
-              await refetch();
-            }
+            const { invalidateProviderSwitchCaches } = await import(
+              "@/lib/query/mutations"
+            );
+            await invalidateProviderSwitchCaches(queryClient, event.appType);
           },
         );
         if (!active) {
@@ -360,7 +361,7 @@ function App() {
       active = false;
       unsubscribe?.();
     };
-  }, [activeApp, refetch]);
+  }, [queryClient]);
 
   useTauriEvent("universal-provider-synced", async () => {
     await queryClient.invalidateQueries({ queryKey: ["providers"] });

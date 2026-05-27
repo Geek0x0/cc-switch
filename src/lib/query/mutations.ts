@@ -10,6 +10,56 @@ import { generateUUID } from "@/utils/uuid";
 import { openclawKeys } from "@/hooks/useOpenClaw";
 import { invalidateHermesProviderCaches } from "@/hooks/useHermes";
 
+export async function invalidateProviderSwitchCaches(
+  queryClient: ReturnType<typeof useQueryClient>,
+  appId: string,
+  options: { refreshTray?: boolean } = {},
+) {
+  await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+
+  if (appId === "claude-desktop") {
+    await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
+    await queryClient.invalidateQueries({ queryKey: ["claudeDesktopStatus"] });
+  }
+
+  if (appId === "opencode") {
+    await queryClient.invalidateQueries({
+      queryKey: ["opencodeLiveProviderIds"],
+    });
+    await queryClient.invalidateQueries({
+      queryKey: ["omo", "current-provider-id"],
+    });
+    await queryClient.invalidateQueries({
+      queryKey: ["omo-slim", "current-provider-id"],
+    });
+  }
+
+  if (appId === "openclaw") {
+    await queryClient.invalidateQueries({
+      queryKey: openclawKeys.liveProviderIds,
+    });
+    await queryClient.invalidateQueries({
+      queryKey: openclawKeys.defaultModel,
+    });
+    await queryClient.invalidateQueries({ queryKey: openclawKeys.health });
+  }
+
+  if (appId === "hermes") {
+    await invalidateHermesProviderCaches(queryClient);
+  }
+
+  if (options.refreshTray ?? false) {
+    try {
+      await providersApi.updateTrayMenu();
+    } catch (trayError) {
+      console.error(
+        "Failed to update tray menu after provider switch",
+        trayError,
+      );
+    }
+  }
+}
+
 export const useAddProviderMutation = (appId: AppId) => {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
@@ -231,49 +281,9 @@ export const useSwitchProviderMutation = (appId: AppId) => {
       return await providersApi.switch(providerId, appId);
     },
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
-      if (appId === "claude-desktop") {
-        await queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
-        await queryClient.invalidateQueries({
-          queryKey: ["claudeDesktopStatus"],
-        });
-      }
-
-      // OpenCode/OpenClaw: also invalidate live provider IDs cache to update button state
-      if (appId === "opencode") {
-        await queryClient.invalidateQueries({
-          queryKey: ["opencodeLiveProviderIds"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["omo", "current-provider-id"],
-        });
-        await queryClient.invalidateQueries({
-          queryKey: ["omo-slim", "current-provider-id"],
-        });
-      }
-      if (appId === "openclaw") {
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.liveProviderIds,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.defaultModel,
-        });
-        await queryClient.invalidateQueries({
-          queryKey: openclawKeys.health,
-        });
-      }
-      if (appId === "hermes") {
-        await invalidateHermesProviderCaches(queryClient);
-      }
-
-      try {
-        await providersApi.updateTrayMenu();
-      } catch (trayError) {
-        console.error(
-          "Failed to update tray menu after switching provider",
-          trayError,
-        );
-      }
+      await invalidateProviderSwitchCaches(queryClient, appId, {
+        refreshTray: true,
+      });
     },
     onError: (error: Error) => {
       const detail = extractErrorMessage(error) || t("common.unknown");

@@ -16,6 +16,7 @@ mod gemini_mcp;
 pub mod hermes_config;
 mod init_status;
 mod lightweight;
+pub mod linux_cli;
 #[cfg(target_os = "linux")]
 mod linux_fix;
 mod mcp;
@@ -843,6 +844,9 @@ pub fn run() {
             );
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
+
+            #[cfg(target_os = "linux")]
+            crate::linux_cli::start_gui_ipc_server(app.handle().clone());
 
             // 从数据库加载日志配置并应用
             {
