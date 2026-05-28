@@ -160,6 +160,23 @@ fn collect_today_usage_by_app(
         .collect())
 }
 
+fn current_provider_name_for_section(
+    app_state: &AppState,
+    section: &TrayAppSection,
+) -> Option<String> {
+    let providers = app_state
+        .db
+        .get_all_providers(section.app_type.as_str())
+        .ok()?;
+    let current_id =
+        crate::settings::get_effective_current_provider(&app_state.db, &section.app_type)
+            .ok()
+            .flatten()?;
+    providers
+        .get(&current_id)
+        .map(|provider| provider.name.clone())
+}
+
 fn format_token_count(tokens: u64) -> String {
     const UNITS: &[(u64, &str)] = &[
         (1, ""),
@@ -233,13 +250,33 @@ fn format_today_usage_title(
 fn format_tray_section_title(
     section: &TrayAppSection,
     today_usage_by_app: &std::collections::HashMap<String, UsageSummary>,
+    current_provider_name: Option<&str>,
     texts: &TrayTexts,
 ) -> String {
+    let label;
+    let app_label = if let Some(provider_name) = current_provider_name {
+        label = format!(
+            "{} [{}]",
+            section.header_label,
+            sanitize_tray_label(provider_name)
+        );
+        label.as_str()
+    } else {
+        section.header_label
+    };
+
     format_today_usage_title(
-        section.header_label,
+        app_label,
         today_usage_by_app.get(section.app_type.as_str()),
         texts,
     )
+}
+
+fn sanitize_tray_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
 }
 
 /// 对供应商列表排序：sort_index → created_at → name
@@ -485,7 +522,15 @@ pub fn create_tray_menu(
             crate::settings::get_effective_current_provider(&app_state.db, &section.app_type)?
                 .unwrap_or_default();
 
-        let submenu_label = format_tray_section_title(section, &today_usage_by_app, &tray_texts);
+        let current_provider_name = providers
+            .get(&current_id)
+            .map(|provider| provider.name.as_str());
+        let submenu_label = format_tray_section_title(
+            section,
+            &today_usage_by_app,
+            current_provider_name,
+            &tray_texts,
+        );
         let submenu_id = format!("submenu_{}", app_type_str);
 
         if providers.is_empty() {
@@ -602,7 +647,13 @@ fn update_tray_usage_labels(app: &tauri::AppHandle) {
         let Some(submenu) = handles.get(&section.app_type) else {
             continue;
         };
-        let new_label = format_tray_section_title(section, &today_usage_by_app, &tray_texts);
+        let current_provider_name = current_provider_name_for_section(&app_state, section);
+        let new_label = format_tray_section_title(
+            section,
+            &today_usage_by_app,
+            current_provider_name.as_deref(),
+            &tray_texts,
+        );
         if let Err(e) = submenu.set_text(&new_label) {
             log::debug!("[Tray] 更新{}子菜单标题失败: {e}", section.log_name);
         }
@@ -837,12 +888,30 @@ mod tests {
         let title = format_tray_section_title(
             &TRAY_SECTIONS[0],
             &usage_by_app,
+            None,
             &TrayTexts::from_language("zh"),
         );
 
         assert_eq!(
             title,
             "Claude\n请求 7\n输入 1.00K\n输出 2.00K\n缓存创建 3.00K\n缓存命中 4.00K"
+        );
+    }
+
+    #[test]
+    fn tray_section_title_includes_current_provider_name() {
+        let usage_by_app = std::collections::HashMap::new();
+
+        let title = format_tray_section_title(
+            &TRAY_SECTIONS[0],
+            &usage_by_app,
+            Some("Claude One"),
+            &TrayTexts::from_language("zh"),
+        );
+
+        assert_eq!(
+            title,
+            "Claude [Claude One]\n请求 0\n输入 0\n输出 0\n缓存创建 0\n缓存命中 0"
         );
     }
 }
