@@ -333,33 +333,37 @@ function App() {
   };
 
   useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
+    let unsubscribe: (() => void)[] = [];
     let active = true;
 
     const setupListener = async () => {
       try {
-        const off = await providersApi.onSwitched(
-          async (event: ProviderSwitchEvent) => {
-            const { invalidateProviderSwitchCaches } = await import(
-              "@/lib/query/mutations"
-            );
-            await invalidateProviderSwitchCaches(queryClient, event.appType);
-          },
-        );
+        const handleProviderChange = async (event: ProviderSwitchEvent) => {
+          const { invalidateProviderSwitchCaches } = await import(
+            "@/lib/query/mutations"
+          );
+          await invalidateProviderSwitchCaches(queryClient, event.appType);
+        };
+        const offSwitched = await providersApi.onSwitched(handleProviderChange);
+        unsubscribe.push(offSwitched);
+        const offUpdated = await providersApi.onUpdated(handleProviderChange);
+        unsubscribe.push(offUpdated);
         if (!active) {
-          off();
+          unsubscribe.forEach((off) => off());
+          unsubscribe = [];
           return;
         }
-        unsubscribe = off;
       } catch (error) {
-        console.error("[App] Failed to subscribe provider switch event", error);
+        unsubscribe.forEach((off) => off());
+        unsubscribe = [];
+        console.error("[App] Failed to subscribe provider change event", error);
       }
     };
 
     void setupListener();
     return () => {
       active = false;
-      unsubscribe?.();
+      unsubscribe.forEach((off) => off());
     };
   }, [queryClient]);
 

@@ -333,16 +333,19 @@ pub fn direct_gateway_credentials(
         })?
         .to_string();
 
-    let api_key = env
-        .get("ANTHROPIC_AUTH_TOKEN")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let api_key = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+        .into_iter()
+        .find_map(|field| {
+            env.get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
         .ok_or_else(|| {
             AppError::localized(
                 "claude_desktop.provider.auth_token_missing",
-                "Claude Desktop 直连供应商缺少 ANTHROPIC_AUTH_TOKEN（Bearer Token）",
-                "Claude Desktop direct provider is missing ANTHROPIC_AUTH_TOKEN (Bearer Token)",
+                "Claude Desktop 直连供应商缺少 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY",
+                "Claude Desktop direct provider is missing ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY",
             )
         })?
         .to_string();
@@ -1280,6 +1283,22 @@ mod tests {
         provider
     }
 
+    fn direct_api_key_provider(id: &str) -> Provider {
+        let mut provider = direct_provider(id);
+        provider.settings_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://gateway.example.com",
+                "ANTHROPIC_API_KEY": "sk-ant"
+            }
+        });
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("anthropic".to_string()),
+            api_key_field: Some("ANTHROPIC_API_KEY".to_string()),
+            ..Default::default()
+        });
+        provider
+    }
+
     fn official_provider() -> Provider {
         let mut provider = Provider::with_id(
             CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID.to_string(),
@@ -1813,17 +1832,35 @@ mod tests {
         });
         assert!(!is_compatible_direct_provider(&full_url));
 
-        let missing_bearer = Provider::with_id(
-            "x-api-key".to_string(),
-            "x-api-key".to_string(),
-            json!({
-                "env": {
-                    "ANTHROPIC_BASE_URL": "https://gateway.example.com",
-                    "ANTHROPIC_API_KEY": "sk-ant"
-                }
-            }),
-            None,
-        );
-        assert!(!is_compatible_direct_provider(&missing_bearer));
+        let api_key_provider = direct_api_key_provider("x-api-key");
+        assert!(is_compatible_direct_provider(&api_key_provider));
+    }
+
+    #[test]
+    fn direct_gateway_credentials_accepts_anthropic_api_key_fallback() {
+        let provider = direct_api_key_provider("x-api-key");
+
+        let credentials = direct_gateway_credentials(&provider)
+            .expect("ANTHROPIC_API_KEY should be accepted for direct providers");
+
+        assert_eq!(credentials.base_url, "https://gateway.example.com");
+        assert_eq!(credentials.api_key, "sk-ant");
+    }
+
+    #[test]
+    fn direct_gateway_credentials_ignores_empty_auth_token_before_api_key_fallback() {
+        let mut provider = direct_api_key_provider("x-api-key");
+        provider.settings_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://gateway.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "   ",
+                "ANTHROPIC_API_KEY": "sk-ant"
+            }
+        });
+
+        let credentials = direct_gateway_credentials(&provider)
+            .expect("non-empty ANTHROPIC_API_KEY should be accepted after blank auth token");
+
+        assert_eq!(credentials.api_key, "sk-ant");
     }
 }

@@ -127,6 +127,15 @@ export const providersApi = {
     });
   },
 
+  async onUpdated(
+    handler: (event: ProviderSwitchEvent) => void,
+  ): Promise<UnlistenFn> {
+    return await listen("provider-updated", (event) => {
+      const payload = event.payload as ProviderSwitchEvent;
+      handler(payload);
+    });
+  },
+
   /**
    * 打开指定提供商的终端
    * 任何提供商都可以打开终端，不受是否为当前激活提供商的限制

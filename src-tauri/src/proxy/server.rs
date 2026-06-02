@@ -46,6 +46,8 @@ pub struct ProxyState {
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
+    #[cfg(test)]
+    pub tray_refresh_count: Arc<std::sync::atomic::AtomicUsize>,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
 }
@@ -80,6 +82,8 @@ impl ProxyServer {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle,
+            #[cfg(test)]
+            tray_refresh_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failover_manager,
         };
 

@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use crate::app_config::AppType;
 use crate::database::Database;
+use crate::provider::Provider;
 use crate::services::{ProviderService, SwitchResult};
 use crate::store::AppState;
 
@@ -18,6 +19,12 @@ pub enum CliCommand {
     Switch {
         app: AppType,
         provider_id: String,
+        json: bool,
+    },
+    UpdateKey {
+        app: AppType,
+        provider_id: String,
+        key: String,
         json: bool,
     },
 }
@@ -77,6 +84,7 @@ where
         "--help" | "-h" | "help" => CliParseOutcome::Help,
         "list" => parse_list_args(&args[2..]),
         "switch" => parse_switch_args(&args[2..]),
+        "update-key" => parse_update_key_args(&args[2..]),
         unknown if !unknown.starts_with('-') => CliParseOutcome::Error(CliError {
             code: "unknown_command",
             message: format!("Unknown command: {unknown}"),
@@ -88,6 +96,43 @@ where
             usage_error(help.trim_end(), args[2..].iter().any(|a| a == "--json"))
         }
     }
+}
+
+fn parse_update_key_args(args: &[String]) -> CliParseOutcome {
+    let mut json = false;
+    let mut positional = Vec::new();
+
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else if arg.starts_with('-') {
+            return usage_error(
+                "Usage: cc-switch update-key <app> <provider-id> <key> [--json]",
+                json,
+            );
+        } else {
+            positional.push(arg);
+        }
+    }
+
+    if positional.len() != 3 {
+        return usage_error(
+            "Usage: cc-switch update-key <app> <provider-id> <key> [--json]",
+            json,
+        );
+    }
+
+    let app = match AppType::from_str(positional[0]) {
+        Ok(parsed) => parsed,
+        Err(err) => return unsupported_app_error(err.to_string(), json),
+    };
+
+    CliParseOutcome::Command(CliCommand::UpdateKey {
+        app,
+        provider_id: positional[1].clone(),
+        key: positional[2].clone(),
+        json,
+    })
 }
 
 fn parse_list_args(args: &[String]) -> CliParseOutcome {
@@ -250,6 +295,26 @@ pub fn format_switch_json(
     .map_err(|source| crate::error::AppError::JsonSerialize { source })
 }
 
+pub fn format_update_key_text(app: &AppType, provider_id: &str) -> String {
+    format!(
+        "Updated API key for {} provider {}\n",
+        sanitize_text_output(app.as_str()),
+        sanitize_text_output(provider_id)
+    )
+}
+
+pub fn format_update_key_json(
+    app: &AppType,
+    provider_id: &str,
+) -> Result<String, crate::error::AppError> {
+    serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "app": app.as_str(),
+        "providerId": provider_id,
+    }))
+    .map_err(|source| crate::error::AppError::JsonSerialize { source })
+}
+
 pub fn execute_switch(
     state: &AppState,
     app: AppType,
@@ -282,6 +347,378 @@ pub fn execute_switch(
     })
 }
 
+pub fn execute_update_key(
+    state: &AppState,
+    app: AppType,
+    provider_id: &str,
+    key: &str,
+) -> Result<(), CliError> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(CliError {
+            code: "empty_api_key",
+            message: "API key cannot be empty".to_string(),
+            exit_code: 2,
+            json: false,
+        });
+    }
+
+    let app_key = app.as_str().to_string();
+
+    let mut provider = state
+        .db
+        .get_provider_by_id(provider_id, &app_key)
+        .map_err(|err| CliError {
+            code: "update_key_failed",
+            message: err.to_string(),
+            exit_code: 1,
+            json: false,
+        })?
+        .ok_or_else(|| CliError {
+            code: "provider_not_found",
+            message: format!("Provider not found: {provider_id} for {}", app.as_str()),
+            exit_code: 1,
+            json: false,
+        })?;
+    let original_provider = provider.clone();
+
+    if provider.uses_managed_account_auth() || codex_provider_uses_managed_auth(&app, &provider) {
+        return Err(CliError {
+            code: "unsupported_provider_auth",
+            message: format!(
+                "Provider {} for {} uses managed account authentication and cannot be updated with update-key",
+                provider_id,
+                app.as_str()
+            ),
+            exit_code: 2,
+            json: false,
+        });
+    }
+
+    let api_key_field = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_key_field.as_deref());
+    set_provider_api_key(&mut provider.settings_config, &app, key, api_key_field);
+    if let Err(err) = ProviderService::update(state, app.clone(), Some(provider_id), provider) {
+        let message = rollback_update_key_after_failure(state, &app, &app_key, &original_provider)
+            .map_or_else(
+                |rollback_err| {
+                    format!(
+                        "{}; additionally failed to roll back provider state: {}",
+                        err, rollback_err
+                    )
+                },
+                |()| err.to_string(),
+            );
+        return Err(CliError {
+            code: "update_key_failed",
+            message,
+            exit_code: 1,
+            json: false,
+        });
+    }
+    Ok(())
+}
+
+fn rollback_update_key_after_failure(
+    state: &AppState,
+    app: &AppType,
+    app_key: &str,
+    original_provider: &Provider,
+) -> Result<(), crate::error::AppError> {
+    state.db.save_provider(app_key, original_provider)?;
+
+    let effective_current = crate::settings::get_effective_current_provider(&state.db, app)?;
+    let is_current = effective_current.as_deref() == Some(original_provider.id.as_str());
+    if !is_current {
+        return Ok(());
+    }
+
+    if app.is_additive_mode() {
+        rollback_additive_live_config(state, app, original_provider)
+    } else {
+        ProviderService::sync_current_provider_for_app(state, app.clone())
+    }
+}
+
+fn rollback_additive_live_config(
+    state: &AppState,
+    app: &AppType,
+    original_provider: &Provider,
+) -> Result<(), crate::error::AppError> {
+    match app {
+        AppType::OpenCode => match original_provider.category.as_deref() {
+            Some("omo") => {
+                if state.db.is_omo_provider_current(
+                    app.as_str(),
+                    &original_provider.id,
+                    crate::services::omo::STANDARD.category,
+                )? {
+                    crate::services::OmoService::write_provider_config_to_file(
+                        original_provider,
+                        &crate::services::omo::STANDARD,
+                    )?;
+                }
+                Ok(())
+            }
+            Some("omo-slim") => {
+                if state.db.is_omo_provider_current(
+                    app.as_str(),
+                    &original_provider.id,
+                    crate::services::omo::SLIM.category,
+                )? {
+                    crate::services::OmoService::write_provider_config_to_file(
+                        original_provider,
+                        &crate::services::omo::SLIM,
+                    )?;
+                }
+                Ok(())
+            }
+            _ => crate::opencode_config::set_provider(
+                &original_provider.id,
+                original_provider.settings_config.clone(),
+            ),
+        },
+        AppType::OpenClaw => crate::openclaw_config::set_provider(
+            &original_provider.id,
+            original_provider.settings_config.clone(),
+        )
+        .map(|_| ()),
+        AppType::Hermes => crate::hermes_config::set_provider(
+            &original_provider.id,
+            original_provider.settings_config.clone(),
+        )
+        .map(|_| ()),
+        _ => Ok(()),
+    }
+}
+
+fn codex_provider_uses_managed_auth(app: &AppType, provider: &Provider) -> bool {
+    if !matches!(app, AppType::Codex) {
+        return false;
+    }
+
+    provider.category.as_deref() == Some("official")
+        || provider
+            .settings_config
+            .get("auth")
+            .is_some_and(crate::codex_config::codex_auth_has_oauth_login_material)
+}
+
+fn set_provider_api_key(
+    config: &mut serde_json::Value,
+    app: &AppType,
+    key: &str,
+    api_key_field: Option<&str>,
+) {
+    match app {
+        AppType::OpenCode => set_nested_api_key(config, &["options", "apiKey"], key),
+        AppType::OpenClaw => set_top_level_api_key(config, key),
+        AppType::Hermes => set_hermes_api_key(config, key),
+        AppType::Codex => set_codex_api_key(config, key),
+        AppType::Gemini => set_env_api_key(config, "GEMINI_API_KEY", key),
+        AppType::Claude | AppType::ClaudeDesktop => {
+            set_anthropic_api_key(config, key, api_key_field)
+        }
+    }
+}
+
+fn set_top_level_api_key(config: &mut serde_json::Value, key: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert(
+            "apiKey".to_string(),
+            serde_json::Value::String(key.to_string()),
+        );
+    }
+}
+
+fn set_hermes_api_key(config: &mut serde_json::Value, key: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("apiKey");
+        obj.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(key.to_string()),
+        );
+    }
+}
+
+fn set_codex_api_key(config: &mut serde_json::Value, key: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+
+    {
+        let auth = obj
+            .entry("auth".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !auth.is_object() {
+            *auth = serde_json::json!({});
+        }
+        if let Some(auth_obj) = auth.as_object_mut() {
+            auth_obj.insert(
+                "OPENAI_API_KEY".to_string(),
+                serde_json::Value::String(key.to_string()),
+            );
+        }
+    }
+
+    if let Some(updated_config) = obj
+        .get("config")
+        .and_then(|value| value.as_str())
+        .and_then(|text| update_codex_existing_experimental_bearer_token(text, key))
+    {
+        obj.insert(
+            "config".to_string(),
+            serde_json::Value::String(updated_config),
+        );
+    }
+}
+
+fn update_codex_existing_experimental_bearer_token(config_text: &str, key: &str) -> Option<String> {
+    if !config_text.contains("experimental_bearer_token") {
+        return None;
+    }
+
+    let mut doc = config_text.parse::<toml_edit::DocumentMut>().ok()?;
+    let provider_id = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+
+    if let Some(provider_id) = provider_id
+        .as_deref()
+        .filter(|id| crate::codex_config::is_custom_codex_model_provider_id(id))
+    {
+        if let Some(provider_table) = doc
+            .get_mut("model_providers")
+            .and_then(|item| item.as_table_mut())
+            .and_then(|table| table.get_mut(provider_id))
+            .and_then(|item| item.as_table_mut())
+        {
+            if provider_table.get("experimental_bearer_token").is_some() {
+                provider_table["experimental_bearer_token"] = toml_edit::value(key);
+                return Some(doc.to_string());
+            }
+        }
+    }
+
+    if doc.get("experimental_bearer_token").is_some() {
+        doc["experimental_bearer_token"] = toml_edit::value(key);
+        return Some(doc.to_string());
+    }
+
+    None
+}
+
+fn set_anthropic_api_key(config: &mut serde_json::Value, key: &str, api_key_field: Option<&str>) {
+    if let Some(obj) = config.as_object_mut() {
+        if obj.contains_key("apiKey") {
+            obj.insert(
+                "apiKey".to_string(),
+                serde_json::Value::String(key.to_string()),
+            );
+            return;
+        }
+    }
+
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let env = obj
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !env.is_object() {
+        *env = serde_json::json!({});
+    }
+    let Some(env_obj) = env.as_object_mut() else {
+        return;
+    };
+
+    let field = if env_obj.contains_key("ANTHROPIC_AUTH_TOKEN") {
+        "ANTHROPIC_AUTH_TOKEN"
+    } else if env_obj.contains_key("ANTHROPIC_API_KEY") {
+        "ANTHROPIC_API_KEY"
+    } else if api_key_field == Some("ANTHROPIC_API_KEY") {
+        "ANTHROPIC_API_KEY"
+    } else {
+        "ANTHROPIC_AUTH_TOKEN"
+    };
+    env_obj.insert(
+        field.to_string(),
+        serde_json::Value::String(key.to_string()),
+    );
+}
+
+fn set_env_api_key(config: &mut serde_json::Value, field: &str, key: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let env = obj
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !env.is_object() {
+        *env = serde_json::json!({});
+    }
+    if let Some(env_obj) = env.as_object_mut() {
+        env_obj.insert(
+            field.to_string(),
+            serde_json::Value::String(key.to_string()),
+        );
+    }
+}
+
+fn set_nested_api_key(config: &mut serde_json::Value, path: &[&str], key: &str) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+
+    let mut current = config;
+    for segment in &path[..path.len().saturating_sub(1)] {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        let Some(obj) = current.as_object_mut() else {
+            return;
+        };
+        current = obj
+            .entry((*segment).to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+
+    if let Some(field) = path.last() {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        if let Some(obj) = current.as_object_mut() {
+            obj.insert(
+                (*field).to_string(),
+                serde_json::Value::String(key.to_string()),
+            );
+        }
+    }
+}
+
 pub fn run_cli_args_with_state<I>(state: &AppState, args: I) -> Option<CliOutput>
 where
     I: IntoIterator<Item = String>,
@@ -310,9 +747,26 @@ where
     let _ = crate::app_store::refresh_app_config_dir_override_from_disk_for_cli();
 
     #[cfg(target_os = "linux")]
-    if let Some(output) = run_cli_via_gui_ipc(&args) {
-        print_cli_output(&output);
-        return Some(output.exit_code);
+    match run_cli_via_gui_ipc(&args) {
+        CliIpcAttempt::Handled(output) => {
+            print_cli_output(&output);
+            return Some(output.exit_code);
+        }
+        CliIpcAttempt::Failed(message) => {
+            let json = cli_args_request_json(&args);
+            let output = error_output(
+                &CliError {
+                    code: "ipc_failed",
+                    message,
+                    exit_code: 1,
+                    json,
+                },
+                json,
+            );
+            print_cli_output(&output);
+            return Some(output.exit_code);
+        }
+        CliIpcAttempt::Unavailable | CliIpcAttempt::NotHandled => {}
     }
 
     let output = match parse_cli_args(args) {
@@ -320,6 +774,7 @@ where
             let json = match &command {
                 CliCommand::List { json, .. } => *json,
                 CliCommand::Switch { json, .. } => *json,
+                CliCommand::UpdateKey { json, .. } => *json,
             };
             let db = match Database::init() {
                 Ok(db) => std::sync::Arc::new(db),
@@ -353,35 +808,74 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn run_cli_via_gui_ipc(args: &[String]) -> Option<CliOutput> {
+enum CliIpcAttempt {
+    Handled(CliOutput),
+    NotHandled,
+    Unavailable,
+    Failed(String),
+}
+
+fn cli_args_request_json(args: &[String]) -> bool {
+    match parse_cli_args(args.to_vec()) {
+        CliParseOutcome::Command(CliCommand::List { json, .. })
+        | CliParseOutcome::Command(CliCommand::Switch { json, .. })
+        | CliParseOutcome::Command(CliCommand::UpdateKey { json, .. }) => json,
+        CliParseOutcome::Error(error) => error.json,
+        _ => args.iter().any(|arg| arg == "--json"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_cli_via_gui_ipc(args: &[String]) -> CliIpcAttempt {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
     let socket_path = cli_ipc_socket_path();
-    let mut stream = UnixStream::connect(socket_path).ok()?;
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(_) => return CliIpcAttempt::Unavailable,
+    };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     let request = CliIpcRequest {
         args: args.to_vec(),
     };
-    let payload = serde_json::to_string(&request).ok()?;
-    if writeln!(stream, "{payload}").is_err() {
-        return None;
+    let payload = match serde_json::to_string(&request) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return CliIpcAttempt::Failed(format!("Failed to serialize CLI IPC request: {err}"))
+        }
+    };
+    if let Err(err) = writeln!(stream, "{payload}") {
+        return CliIpcAttempt::Failed(format!("Failed to send CLI IPC request: {err}"));
     }
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).ok()? == 0 {
-        return None;
+    let bytes_read = match reader.read_line(&mut line) {
+        Ok(bytes_read) => bytes_read,
+        Err(err) => {
+            return CliIpcAttempt::Failed(format!("Failed to read CLI IPC response: {err}"))
+        }
+    };
+    if bytes_read == 0 {
+        return CliIpcAttempt::Failed(
+            "CLI IPC server closed the connection without a response".to_string(),
+        );
     }
 
-    let response: CliIpcResponse = serde_json::from_str(line.trim_end()).ok()?;
+    let response: CliIpcResponse = match serde_json::from_str(line.trim_end()) {
+        Ok(response) => response,
+        Err(err) => {
+            return CliIpcAttempt::Failed(format!("Failed to parse CLI IPC response: {err}"))
+        }
+    };
     if !response.handled {
-        return None;
+        return CliIpcAttempt::NotHandled;
     }
 
-    Some(CliOutput {
+    CliIpcAttempt::Handled(CliOutput {
         stdout: response.stdout,
         stderr: response.stderr,
         exit_code: response.exit_code,
@@ -482,10 +976,21 @@ fn execute_gui_ipc_request(
     use tauri::Manager;
 
     let parsed = parse_cli_args(request.args.clone());
-    let switch_event = match &parsed {
+    let provider_change_event = match &parsed {
         CliParseOutcome::Command(CliCommand::Switch {
             app, provider_id, ..
-        }) => Some((app.as_str().to_string(), provider_id.clone())),
+        }) => Some((
+            "provider-switched",
+            app.as_str().to_string(),
+            provider_id.clone(),
+        )),
+        CliParseOutcome::Command(CliCommand::UpdateKey {
+            app, provider_id, ..
+        }) => Some((
+            "provider-updated",
+            app.as_str().to_string(),
+            provider_id.clone(),
+        )),
         _ => None,
     };
 
@@ -505,8 +1010,8 @@ fn execute_gui_ipc_request(
     };
 
     if output.exit_code == 0 {
-        if let Some((app_type, provider_id)) = switch_event {
-            emit_provider_switched(app_handle, &app_type, &provider_id);
+        if let Some((event_name, app_type, provider_id)) = provider_change_event {
+            emit_provider_changed(app_handle, event_name, &app_type, &provider_id);
         }
     }
 
@@ -531,14 +1036,19 @@ impl CliIpcResponse {
 }
 
 #[cfg(target_os = "linux")]
-fn emit_provider_switched(app_handle: &tauri::AppHandle, app_type: &str, provider_id: &str) {
+fn emit_provider_changed(
+    app_handle: &tauri::AppHandle,
+    event_name: &str,
+    app_type: &str,
+    provider_id: &str,
+) {
     use tauri::{Emitter, Manager};
 
     if let Some(app_state) = app_handle.try_state::<AppState>() {
         if let Ok(new_menu) = crate::tray::create_tray_menu(app_handle, app_state.inner()) {
             if let Some(tray) = app_handle.tray_by_id(crate::tray::TRAY_ID) {
                 if let Err(err) = tray.set_menu(Some(new_menu)) {
-                    log::debug!("Failed to refresh tray menu after CLI switch: {err}");
+                    log::debug!("Failed to refresh tray menu after CLI provider change: {err}");
                 }
             }
         }
@@ -548,8 +1058,8 @@ fn emit_provider_switched(app_handle: &tauri::AppHandle, app_type: &str, provide
         "appType": app_type,
         "providerId": provider_id,
     });
-    if let Err(err) = app_handle.emit("provider-switched", event_data) {
-        log::debug!("Failed to emit provider-switched after CLI switch: {err}");
+    if let Err(err) = app_handle.emit(event_name, event_data) {
+        log::debug!("Failed to emit {event_name} after CLI provider change: {err}");
     }
 }
 
@@ -601,7 +1111,7 @@ fn print_cli_output(output: &CliOutput) {
 }
 
 fn help_text() -> String {
-    "Usage: cc-switch list [app] [--json]\nUsage: cc-switch switch <app> <provider-id> [--json]\n"
+    "Usage: cc-switch list [app] [--json]\nUsage: cc-switch switch <app> <provider-id> [--json]\nUsage: cc-switch update-key <app> <provider-id> <key> [--json]\n"
         .to_string()
 }
 
@@ -679,6 +1189,45 @@ pub fn run_cli_command(state: &AppState, command: CliCommand) -> CliOutput {
                 json,
             ),
         },
+        CliCommand::UpdateKey {
+            app,
+            provider_id,
+            key,
+            json,
+        } => match execute_update_key(state, app.clone(), &provider_id, &key) {
+            Ok(()) => {
+                let formatted = if json {
+                    format_update_key_json(&app, &provider_id)
+                } else {
+                    Ok(format_update_key_text(&app, &provider_id))
+                };
+                match formatted {
+                    Ok(stdout) => CliOutput {
+                        stdout: ensure_trailing_newline(stdout),
+                        stderr: String::new(),
+                        exit_code: 0,
+                    },
+                    Err(err) => error_output(
+                        &CliError {
+                            code: "update_key_failed",
+                            message: err.to_string(),
+                            exit_code: 1,
+                            json,
+                        },
+                        json,
+                    ),
+                }
+            }
+            Err(err) => error_output(
+                &CliError {
+                    code: err.code,
+                    message: err.message,
+                    exit_code: err.exit_code,
+                    json,
+                },
+                json,
+            ),
+        },
     }
 }
 
@@ -720,7 +1269,7 @@ fn sanitize_text_output(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::provider::Provider;
+    use crate::provider::{Provider, ProviderMeta};
     use serial_test::serial;
     use std::env;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -829,6 +1378,30 @@ mod tests {
             }),
             None,
         )
+    }
+
+    fn provider_api_key(provider: &Provider) -> Option<&str> {
+        provider
+            .settings_config
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_API_KEY"))
+            .and_then(|value| value.as_str())
+    }
+
+    fn auth_token(provider: &Provider) -> Option<&str> {
+        provider
+            .settings_config
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
+            .and_then(|value| value.as_str())
+    }
+
+    fn codex_auth_key(provider: &Provider) -> Option<&str> {
+        provider
+            .settings_config
+            .get("auth")
+            .and_then(|auth| auth.get("OPENAI_API_KEY"))
+            .and_then(|value| value.as_str())
     }
 
     #[test]
@@ -986,6 +1559,238 @@ mod tests {
     }
 
     #[test]
+    fn format_update_key_text_includes_app_and_provider_id() {
+        assert_eq!(
+            format_update_key_text(&AppType::Claude, "provider-1"),
+            "Updated API key for claude provider provider-1\n"
+        );
+    }
+
+    #[test]
+    fn format_update_key_json_reports_success_without_key_value() {
+        assert_eq!(
+            format_update_key_json(&AppType::Codex, "provider-2").unwrap(),
+            r#"{"ok":true,"app":"codex","providerId":"provider-2"}"#
+        );
+    }
+
+    #[test]
+    fn set_provider_api_key_updates_opencode_options_api_key() {
+        let mut config = serde_json::json!({
+            "options": {
+                "apiKey": "old-key",
+                "baseURL": "https://example.test"
+            }
+        });
+
+        set_provider_api_key(&mut config, &AppType::OpenCode, "new-key", None);
+
+        assert_eq!(config["options"]["apiKey"], "new-key");
+        assert!(config.get("env").is_none());
+    }
+
+    #[test]
+    fn set_provider_api_key_updates_top_level_api_key_for_openclaw() {
+        let mut config = serde_json::json!({
+            "apiKey": "old-key",
+            "baseUrl": "https://example.test"
+        });
+
+        set_provider_api_key(&mut config, &AppType::OpenClaw, "new-key", None);
+
+        assert_eq!(config["apiKey"], "new-key");
+    }
+
+    #[test]
+    fn set_provider_api_key_updates_codex_auth_openai_api_key() {
+        let mut config = serde_json::json!({
+            "auth": {
+                "OPENAI_API_KEY": "old-key"
+            },
+            "config": "model_provider = \"openrouter\"\n[model_providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n"
+        });
+
+        set_provider_api_key(&mut config, &AppType::Codex, "new-key", None);
+
+        assert_eq!(config["auth"]["OPENAI_API_KEY"], "new-key");
+        assert!(config.get("env").is_none());
+    }
+
+    #[test]
+    fn set_provider_api_key_updates_codex_existing_experimental_bearer_token() {
+        let mut config = serde_json::json!({
+            "auth": {},
+            "config": "model_provider = \"openrouter\"\n[model_providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\nexperimental_bearer_token = \"old-key\"\n"
+        });
+
+        set_provider_api_key(&mut config, &AppType::Codex, "new-key", None);
+
+        let config_text = config["config"].as_str().expect("codex config text");
+        assert!(config_text.contains("experimental_bearer_token = \"new-key\""));
+        assert!(config.get("env").is_none());
+    }
+
+    #[test]
+    fn set_provider_api_key_updates_hermes_snake_case_api_key() {
+        let mut config = serde_json::json!({
+            "base_url": "https://example.test",
+            "api_key": "old-key"
+        });
+
+        set_provider_api_key(&mut config, &AppType::Hermes, "new-key", None);
+
+        assert_eq!(config["api_key"], "new-key");
+        assert!(config.get("apiKey").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_rejects_managed_account_provider() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let mut provider = claude_provider("copilot", "Copilot", "old-key");
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("claude", &provider)
+            .expect("save provider");
+
+        let error = execute_update_key(&state, AppType::Claude, "copilot", "new-key")
+            .expect_err("managed account provider should be rejected");
+
+        assert_eq!(error.code, "unsupported_provider_auth");
+        assert_eq!(error.exit_code, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_rejects_codex_official_provider() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let mut provider = Provider::with_id(
+            "official".to_string(),
+            "OpenAI Official".to_string(),
+            serde_json::json!({
+                "auth": {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "oauth-access"
+                    }
+                },
+                "config": ""
+            }),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        db.save_provider("codex", &provider).expect("save provider");
+
+        let error = execute_update_key(&state, AppType::Codex, "official", "new-key")
+            .expect_err("official codex provider should be rejected");
+
+        assert_eq!(error.code, "unsupported_provider_auth");
+        assert_eq!(error.exit_code, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_uses_meta_api_key_field_when_claude_env_key_missing() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let mut provider = Provider::with_id(
+            "p1".to_string(),
+            "Claude One".to_string(),
+            serde_json::json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_key_field: Some("ANTHROPIC_API_KEY".to_string()),
+            ..Default::default()
+        });
+        db.save_provider("claude", &provider)
+            .expect("save provider");
+
+        execute_update_key(&state, AppType::Claude, "p1", "new-key").expect("update api key");
+
+        let updated = db
+            .get_provider_by_id("p1", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(provider_api_key(&updated), Some("new-key"));
+        assert_eq!(auth_token(&updated), None);
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_updates_codex_auth_key_used_by_ui() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "Codex One".to_string(),
+            serde_json::json!({
+                "auth": {
+                    "OPENAI_API_KEY": "old-key"
+                },
+                "config": "model_provider = \"openrouter\"\n[model_providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n"
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).expect("save provider");
+
+        execute_update_key(&state, AppType::Codex, "p1", "new-key").expect("update api key");
+
+        let updated = db
+            .get_provider_by_id("p1", "codex")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(updated.settings_config["auth"]["OPENAI_API_KEY"], "new-key");
+        assert!(updated.settings_config.get("env").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_updates_hermes_snake_case_key_used_by_ui() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "Hermes One".to_string(),
+            serde_json::json!({
+                "base_url": "https://example.test",
+                "api_key": "old-key"
+            }),
+            None,
+        );
+        db.save_provider("hermes", &provider)
+            .expect("save provider");
+
+        execute_update_key(&state, AppType::Hermes, "p1", "new-key").expect("update api key");
+
+        let updated = db
+            .get_provider_by_id("p1", "hermes")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(updated.settings_config["api_key"], "new-key");
+        assert!(updated.settings_config.get("apiKey").is_none());
+    }
+
+    #[test]
     #[serial]
     fn execute_switch_updates_current_provider_by_id() {
         let _guard = settings_test_guard();
@@ -1030,6 +1835,172 @@ mod tests {
         assert_eq!(error.code, "provider_not_found");
         assert_eq!(error.exit_code, 1);
         assert_eq!(error.message, "Provider not found: missing for claude");
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_updates_existing_provider_api_key() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        db.save_provider("claude", &claude_provider("p1", "Claude One", "old-key"))
+            .expect("save provider");
+
+        execute_update_key(&state, AppType::Claude, "p1", "new-key").expect("update api key");
+
+        let updated = db
+            .get_provider_by_id("p1", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(provider_api_key(&updated), Some("new-key"));
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_rejects_empty_key() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db);
+
+        let error = execute_update_key(&state, AppType::Claude, "p1", "").unwrap_err();
+
+        assert_eq!(error.code, "empty_api_key");
+        assert_eq!(error.exit_code, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_rejects_blank_key() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        db.save_provider("claude", &claude_provider("p1", "Claude One", "old-key"))
+            .expect("save provider");
+
+        let error = execute_update_key(&state, AppType::Claude, "p1", "   ")
+            .expect_err("blank api key should be rejected");
+
+        assert_eq!(error.code, "empty_api_key");
+        assert_eq!(error.exit_code, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_rolls_back_provider_when_live_sync_fails() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "Codex One".to_string(),
+            serde_json::json!({
+                "auth": {
+                    "OPENAI_API_KEY": "old-key"
+                },
+                "config": ""
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", "p1")
+            .expect("set db current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
+            .expect("set local current provider");
+
+        let error = execute_update_key(&state, AppType::Codex, "p1", "new-key")
+            .expect_err("empty live codex config should reject bearer token write");
+
+        assert_eq!(error.code, "update_key_failed");
+        let updated = db
+            .get_provider_by_id("p1", "codex")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(codex_auth_key(&updated), Some("old-key"));
+    }
+
+    #[test]
+    #[serial]
+    fn execute_update_key_rolls_back_live_config_when_mcp_sync_fails_after_live_write() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+        let codex_dir = crate::codex_config::get_codex_config_dir();
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir");
+
+        let original_live_config = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Old"
+base_url = "https://old.example/v1"
+experimental_bearer_token = "old-key"
+
+[mcp_servers.bad]
+type = "stdio"
+command = "ok"
+"#;
+        crate::config::write_text_file(
+            &crate::codex_config::get_codex_config_path(),
+            original_live_config,
+        )
+        .expect("write initial live config");
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "Codex One".to_string(),
+            serde_json::json!({
+                "auth": {
+                    "OPENAI_API_KEY": "old-key"
+                },
+                "config": original_live_config
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", "p1")
+            .expect("set db current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
+            .expect("set local current provider");
+        std::fs::create_dir_all(crate::opencode_config::get_opencode_dir())
+            .expect("create opencode dir");
+        db.save_mcp_server(&crate::app_config::McpServer {
+            id: "bad".to_string(),
+            name: "Bad".to_string(),
+            server: serde_json::json!({
+                "type": "unsupported"
+            }),
+            apps: crate::app_config::McpApps {
+                opencode: true,
+                ..Default::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("save invalid mcp server");
+
+        let error = execute_update_key(&state, AppType::Codex, "p1", "new-key")
+            .expect_err("invalid MCP sync should fail after live write");
+
+        assert_eq!(error.code, "update_key_failed");
+        let updated = db
+            .get_provider_by_id("p1", "codex")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(codex_auth_key(&updated), Some("old-key"));
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read live config");
+        assert!(live_config.contains("experimental_bearer_token = \"old-key\""));
+        assert!(!live_config.contains("experimental_bearer_token = \"new-key\""));
     }
 
     #[test]
@@ -1174,6 +2145,37 @@ mod tests {
 
     #[test]
     #[serial]
+    fn run_cli_command_outputs_text_update_key_success() {
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+
+        let db = Arc::new(Database::memory().expect("create memory db"));
+        let state = AppState::new(db.clone());
+        db.save_provider("claude", &claude_provider("p1", "Claude One", "old-key"))
+            .expect("save provider");
+
+        let output = run_cli_command(
+            &state,
+            CliCommand::UpdateKey {
+                app: AppType::Claude,
+                provider_id: "p1".to_string(),
+                key: "new-key".to_string(),
+                json: false,
+            },
+        );
+
+        assert_eq!(
+            output,
+            CliOutput {
+                stdout: "Updated API key for claude provider p1\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            }
+        );
+    }
+
+    #[test]
+    #[serial]
     fn run_cli_command_outputs_json_error_to_stderr() {
         let _guard = settings_test_guard();
         let _home = TempHome::new();
@@ -1230,6 +2232,9 @@ mod tests {
         assert!(output
             .stdout
             .contains("Usage: cc-switch switch <app> <provider-id> [--json]"));
+        assert!(output
+            .stdout
+            .contains("Usage: cc-switch update-key <app> <provider-id> <key> [--json]"));
     }
 
     #[test]
@@ -1460,6 +2465,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_key_with_key() {
+        assert_eq!(
+            parse(&["cc-switch", "update-key", "claude", "provider-1", "sk-new"]),
+            CliParseOutcome::Command(CliCommand::UpdateKey {
+                app: AppType::Claude,
+                provider_id: "provider-1".to_string(),
+                key: "sk-new".to_string(),
+                json: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_update_key_with_json_flag() {
+        assert_eq!(
+            parse(&[
+                "cc-switch",
+                "update-key",
+                "--json",
+                "gemini",
+                "provider-1",
+                "AIza-new",
+            ]),
+            CliParseOutcome::Command(CliCommand::UpdateKey {
+                app: AppType::Gemini,
+                provider_id: "provider-1".to_string(),
+                key: "AIza-new".to_string(),
+                json: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_update_key_missing_key_is_error() {
+        assert_eq!(
+            parse(&["cc-switch", "update-key", "claude", "provider-1"]),
+            CliParseOutcome::Error(CliError {
+                code: "usage",
+                message: "Usage: cc-switch update-key <app> <provider-id> <key> [--json]"
+                    .to_string(),
+                exit_code: 2,
+                json: false,
+            })
+        );
+    }
+
+    #[test]
     fn parse_unknown_cli_like_command_is_error() {
         assert_eq!(
             parse(&["cc-switch", "providers"]),
@@ -1593,6 +2645,64 @@ mod tests {
                 json: false,
             })
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn run_if_cli_args_does_not_replay_command_after_gui_ipc_bad_response() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let _guard = settings_test_guard();
+        let _home = TempHome::new();
+        let runtime_dir = TempDir::new().expect("create runtime dir");
+        let original_runtime_dir = env::var("XDG_RUNTIME_DIR").ok();
+        env::set_var("XDG_RUNTIME_DIR", runtime_dir.path());
+
+        let socket_path = cli_ipc_socket_path();
+        std::fs::create_dir_all(socket_path.parent().expect("socket parent"))
+            .expect("create socket parent");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind dummy ipc socket");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept cli connection");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read cli request");
+            stream
+                .write_all(b"not-json\n")
+                .expect("write malformed ipc response");
+        });
+
+        {
+            let db = Database::init().expect("create persistent test db");
+            db.save_provider("claude", &claude_provider("p1", "Claude One", "old-key"))
+                .expect("save provider");
+        }
+
+        let exit_code = run_if_cli_args(vec![
+            "cc-switch".to_string(),
+            "update-key".to_string(),
+            "claude".to_string(),
+            "p1".to_string(),
+            "new-key".to_string(),
+        ])
+        .expect("cli args should be handled");
+        handle.join().expect("dummy ipc server should finish");
+
+        let db = Database::init().expect("reopen persistent test db");
+        let updated = db
+            .get_provider_by_id("p1", "claude")
+            .expect("read provider")
+            .expect("provider exists");
+        assert_eq!(exit_code, 1);
+        assert_eq!(provider_api_key(&updated), Some("old-key"));
+
+        match original_runtime_dir {
+            Some(value) => env::set_var("XDG_RUNTIME_DIR", value),
+            None => env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     #[cfg(target_os = "linux")]

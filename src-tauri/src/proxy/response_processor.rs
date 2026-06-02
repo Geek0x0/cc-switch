@@ -654,7 +654,7 @@ async fn log_usage_internal(
         usage.cache_creation_tokens
     );
 
-    if let Err(e) = logger.log_with_calculation(
+    match logger.log_with_calculation(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -670,7 +670,19 @@ async fn log_usage_internal(
         None, // provider_type
         is_streaming,
     ) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
+        Ok(()) => schedule_tray_refresh_after_usage_log(state),
+        Err(e) => log::warn!("[USG-001] 记录使用量失败: {e}"),
+    }
+}
+
+pub(crate) fn schedule_tray_refresh_after_usage_log(state: &ProxyState) {
+    #[cfg(test)]
+    state
+        .tray_refresh_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if let Some(app_handle) = &state.app_handle {
+        crate::tray::schedule_tray_refresh(app_handle);
     }
 }
 
@@ -944,6 +956,7 @@ mod tests {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle: None,
+            tray_refresh_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }
     }
@@ -1101,6 +1114,48 @@ mod tests {
         assert_eq!(
             Decimal::from_str(&total_cost).unwrap(),
             Decimal::from_str("1.5").unwrap()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_usage_schedules_tray_refresh_after_successful_insert() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        let app_type = "claude";
+        seed_pricing(&db)?;
+        insert_provider(&db, "provider-tray", app_type, ProviderMeta::default())?;
+
+        let state = build_state(db);
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: None,
+            message_id: None,
+        };
+
+        log_usage_internal(
+            &state,
+            "provider-tray",
+            app_type,
+            "resp-model",
+            "resp-model",
+            usage,
+            10,
+            None,
+            false,
+            200,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .tray_refresh_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
         Ok(())
     }

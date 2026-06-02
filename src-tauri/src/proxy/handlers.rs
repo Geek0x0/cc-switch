@@ -25,8 +25,8 @@ use super::{
     },
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
-        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        schedule_tray_refresh_after_usage_log, strip_entity_headers_for_rebuilt_body,
+        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -1105,7 +1105,7 @@ fn log_forward_error(
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    if let Err(e) = logger.log_error_with_context(
+    match logger.log_error_with_context(
         request_id,
         ctx.provider.id.clone(),
         ctx.app_type_str.to_string(),
@@ -1117,7 +1117,8 @@ fn log_forward_error(
         Some(ctx.session_id.clone()),
         None,
     ) {
-        log::warn!("记录失败请求日志失败: {e}");
+        Ok(()) => schedule_tray_refresh_after_usage_log(state),
+        Err(e) => log::warn!("记录失败请求日志失败: {e}"),
     }
 }
 
@@ -1154,7 +1155,7 @@ async fn log_usage(
 
     let request_id = usage.dedup_request_id();
 
-    if let Err(e) = logger.log_with_calculation(
+    match logger.log_with_calculation(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -1170,14 +1171,46 @@ async fn log_usage(
         None, // provider_type
         is_streaming,
     ) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
+        Ok(()) => schedule_tray_refresh_after_usage_log(state),
+        Err(e) => log::warn!("[USG-001] 记录使用量失败: {e}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{responses_sse_to_response_value, should_use_claude_transform_streaming};
+    use super::{
+        log_usage, responses_sse_to_response_value, should_use_claude_transform_streaming,
+    };
+    use crate::database::Database;
+    use crate::error::AppError;
+    use crate::proxy::failover_switch::FailoverSwitchManager;
+    use crate::proxy::provider_router::ProviderRouter;
+    use crate::proxy::providers::{
+        codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore,
+    };
+    use crate::proxy::server::ProxyState;
+    use crate::proxy::types::{ProxyConfig, ProxyStatus};
+    use crate::proxy::usage::parser::TokenUsage;
     use crate::proxy::ProxyError;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn build_state(db: Arc<Database>) -> ProxyState {
+        ProxyState {
+            db: db.clone(),
+            config: Arc::new(RwLock::new(ProxyConfig::default())),
+            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            start_time: Arc::new(RwLock::new(None)),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            provider_router: Arc::new(ProviderRouter::new(db.clone())),
+            gemini_shadow: Arc::new(GeminiShadowStore::default()),
+            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            app_handle: None,
+            tray_refresh_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+        }
+    }
 
     #[test]
     fn codex_oauth_responses_force_streaming_even_if_client_sent_false() {
@@ -1262,5 +1295,42 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n";
 
         assert!(responses_sse_to_response_value(sse).is_err());
+    }
+
+    #[tokio::test]
+    async fn log_usage_schedules_tray_refresh_after_successful_insert() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let state = build_state(db);
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: None,
+            message_id: None,
+        };
+
+        log_usage(
+            &state,
+            "provider-tray",
+            "claude",
+            "model-tray",
+            "model-tray",
+            usage,
+            10,
+            None,
+            false,
+            200,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .tray_refresh_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        Ok(())
     }
 }
