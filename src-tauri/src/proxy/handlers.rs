@@ -8,6 +8,7 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    error::{PROVIDER_REQUEST_FAILED_MESSAGE, PROXY_REQUEST_FAILED_MESSAGE},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
     handler_config::{
@@ -23,9 +24,11 @@ use super::{
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
         transform_codex_chat, transform_gemini, transform_responses,
     },
+    response_guard,
     response_processor::{
+        collect_streaming_body_from_stream, collect_streaming_response_body,
         create_logged_passthrough_stream, process_response, read_decoded_body,
-        schedule_tray_refresh_after_usage_log, strip_entity_headers_for_rebuilt_body,
+        redacted_provider_failure_response, strip_entity_headers_for_rebuilt_body,
         strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
@@ -312,12 +315,22 @@ async fn handle_claude_transform(
 
     if use_streaming {
         // 根据 api_format 选择流式转换器
-        let stream = response.bytes_stream();
         let sse_stream: Box<
             dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
         > = if api_format == "openai_responses" {
+            let body_bytes =
+                collect_streaming_response_body(response, ctx.tag, ctx.streaming_timeout_config())
+                    .await?;
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            if response_guard::responses_sse_has_blocked_content(&body_text) {
+                log::warn!("[Claude] 拦截包含被屏蔽内容的 Responses 流式成功响应");
+                return Ok(redacted_provider_failure_response(ctx.app_type_str));
+            }
+            let stream =
+                futures::stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
             Box::new(Box::pin(create_anthropic_sse_stream_from_responses(stream)))
         } else if api_format == "gemini_native" {
+            let stream = response.bytes_stream();
             Box::new(Box::pin(create_anthropic_sse_stream_from_gemini(
                 stream,
                 Some(state.gemini_shadow.clone()),
@@ -326,6 +339,7 @@ async fn handle_claude_transform(
                 tool_schema_hints.clone(),
             )))
         } else {
+            let stream = response.bytes_stream();
             Box::new(Box::pin(create_anthropic_sse_stream(stream)))
         };
 
@@ -419,6 +433,11 @@ async fn handle_claude_transform(
             ProxyError::TransformError(format!("Failed to parse upstream response: {e}"))
         })?
     };
+
+    if response_guard::responses_success_has_blocked_content(&upstream_response) {
+        log::warn!("[Claude] 拦截包含被屏蔽内容的 Responses 非流式成功响应");
+        return Ok(redacted_provider_failure_response(ctx.app_type_str));
+    }
 
     // 根据 api_format 选择非流式转换器
     let anthropic_response = if api_format == "openai_responses" {
@@ -750,6 +769,14 @@ async fn handle_codex_chat_to_responses_transform(
         let stream = response.bytes_stream();
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
+        let timeout_config = ctx.streaming_timeout_config();
+        let body_bytes =
+            collect_streaming_body_from_stream(sse_stream, ctx.tag, timeout_config).await?;
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        if response_guard::responses_sse_has_blocked_content(&body_text) {
+            log::warn!("[Codex] 拦截包含被屏蔽内容的 Chat → Responses 流式成功响应");
+            return Ok(redacted_provider_failure_response(ctx.app_type_str));
+        }
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
@@ -794,11 +821,13 @@ async fn handle_codex_chat_to_responses_transform(
             None
         };
 
+        let sse_stream =
+            futures::stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
         let logged_stream = create_logged_passthrough_stream(
             sse_stream,
             ctx.tag,
             usage_collector,
-            ctx.streaming_timeout_config(),
+            timeout_config,
             connection_guard,
         );
 
@@ -838,6 +867,10 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
         e
     })?;
+    if response_guard::responses_success_has_blocked_content(&responses_response) {
+        log::warn!("[Codex] 拦截包含被屏蔽内容的 Chat → Responses 非流式成功响应");
+        return Ok(redacted_provider_failure_response(ctx.app_type_str));
+    }
     state
         .codex_chat_history
         .record_response(&responses_response)
@@ -901,12 +934,12 @@ async fn handle_codex_chat_to_responses_transform(
         })
 }
 
-/// 把上游 Chat Completions 的错误响应转换为 Responses API 错误形状。
+/// 把上游 Chat Completions 的错误响应转换为脱敏的 Responses API 错误形状。
 ///
 /// 与正常响应分支配套：正常响应已经被改写成 Responses 形式，错误响应若仍保留
 /// Chat 错误体（如 MiniMax 的 `{"base_resp": {"status_code": 2013}}`），Codex
-/// 客户端的错误处理就无法对齐字段。这里读取上游 body、规整成
-/// `{"error": {message, type, code, param}}` 并保留原始 HTTP 状态码。
+/// 客户端的错误处理就无法对齐字段。这里保留原始 HTTP 状态码和可转发响应头，
+/// 但不把上游 body/message 传给客户端。
 async fn handle_codex_chat_error_response(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
@@ -918,31 +951,18 @@ async fn handle_codex_chat_error_response(
         } else {
             std::time::Duration::ZERO
         };
-    let (mut response_headers, _status, body_bytes) =
-        read_decoded_body(response, ctx.tag, body_timeout).await?;
+    build_codex_redacted_upstream_error_response(response, ctx.tag, body_timeout, status).await
+}
 
-    // 非 JSON 上游错误体（Cloudflare HTML、纯文本 "Unauthorized" 等）若丢成 None，
-    // 客户端就看不到原始诊断信息；包成 Value::String 走转换函数的字符串分支。
-    let parsed_value: Value = match serde_json::from_slice::<Value>(&body_bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            const MAX_RAW_ERROR_BYTES: usize = 1024;
-            let lossy = String::from_utf8_lossy(&body_bytes);
-            let truncated = if lossy.len() > MAX_RAW_ERROR_BYTES {
-                let mut end = MAX_RAW_ERROR_BYTES;
-                while end > 0 && !lossy.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("{}…(truncated)", &lossy[..end])
-            } else {
-                lossy.into_owned()
-            };
-            log::warn!("[Codex] Chat 错误响应不是合法 JSON，按文本透传: {truncated}");
-            Value::String(truncated)
-        }
-    };
-
-    let responses_error = transform_codex_chat::chat_error_to_response_error(Some(&parsed_value));
+async fn build_codex_redacted_upstream_error_response(
+    response: super::hyper_client::ProxyResponse,
+    tag: &'static str,
+    body_timeout: std::time::Duration,
+    status: axum::http::StatusCode,
+) -> Result<axum::response::Response, ProxyError> {
+    let (mut response_headers, _status, _body_bytes) =
+        read_decoded_body(response, tag, body_timeout).await?;
+    let responses_error = codex_upstream_error_json();
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -969,15 +989,12 @@ async fn handle_codex_chat_error_response(
     })
 }
 
-/// 把转发层（非上游响应）的失败构造成富化的 Codex 错误响应。
+/// 把转发层（非上游响应）的失败构造成脱敏的 Codex 错误响应。
 ///
 /// 与 `handle_codex_chat_error_response`（处理上游真实错误响应、复制上游头）不同，
 /// 这里没有上游响应可参照，只产出一个 `application/json` 错误体。状态码走
 /// `map_proxy_error_to_status`，该函数已与 `ProxyError::into_response` 对齐。
 ///
-/// 注意：`endpoint` 经 `endpoint_with_query` 可能携带 query（如 `?beta=true`）并被
-/// 原样写入错误体。当前 Codex 端点不在 query 里放凭证，故安全；若将来复用到
-/// query 携带密钥的端点（如 Gemini 的 `?key=`），需先脱敏再回显。
 fn build_codex_proxy_error_response(
     ctx: &RequestContext,
     endpoint: &str,
@@ -1005,118 +1022,40 @@ fn build_codex_proxy_error_response(
 }
 
 fn codex_proxy_error_json(
-    provider_name: &str,
-    request_model: &str,
-    endpoint: &str,
+    _provider_name: &str,
+    _request_model: &str,
+    _endpoint: &str,
     error: &ProxyError,
 ) -> Value {
-    let (mut body, upstream_status) = match error {
-        ProxyError::UpstreamError { status, body } => {
-            let parsed_body = body
-                .as_deref()
-                .map(|body| serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!(body)));
-            (
-                transform_codex_chat::chat_error_to_response_error(parsed_body.as_ref()),
-                Some(*status),
-            )
-        }
-        _ => (
-            json!({
-                "error": {
-                    "message": get_error_message(error),
-                    "type": "proxy_error",
-                    "code": codex_proxy_error_code(error),
-                    "param": Value::Null,
-                }
-            }),
-            None,
-        ),
-    };
+    if matches!(error, ProxyError::UpstreamError { .. }) {
+        return codex_upstream_error_json();
+    }
 
-    let Some(error_obj) = body
-        .get_mut("error")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return body;
-    };
-
-    let message = if upstream_status == Some(413) {
-        // 413 来自上游渠道商的网关（典型是 nginx 的 client_max_body_size），不是 CC
-        // Switch 本地代理的限制（本地 DefaultBodyLimit 已放到 200MB）。上游响应体往往是
-        // 一整段 nginx HTML，对用户毫无价值，这里替换成明确指向上游 + 可操作的指引，
-        // 避免「以为是 CC Switch 封装了 nginx / 是本地代理的锅」这种反复出现的误解。
-        format!(
-            concat!(
-                "Upstream provider rejected the request with HTTP 413 (Payload Too Large). ",
-                "The request body exceeds the upstream gateway's size limit; this is the ",
-                "provider's server-side limit, not a CC Switch limit. ",
-                "Provider: {provider}; model: {model}; endpoint: {endpoint}. ",
-                "To recover, shrink the request: run /compact, remove large pasted logs or ",
-                "inline images, or ask the provider to raise its request body limit ",
-                "(e.g. nginx client_max_body_size)."
-            ),
-            provider = provider_name,
-            model = request_model,
-            endpoint = endpoint,
-        )
+    let message = if error.is_provider_request_failure() {
+        PROVIDER_REQUEST_FAILED_MESSAGE
     } else {
-        let cause = error_obj
-            .get("message")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| get_error_message(error));
-        let status_fragment = upstream_status
-            .map(|status| format!("; upstream_status: HTTP {status}"))
-            .unwrap_or_default();
-        format!(
-            "CC Switch local proxy failed while handling Codex endpoint {endpoint}. Provider: {provider_name}; model: {request_model}{status_fragment}; cause: {cause}"
-        )
+        PROXY_REQUEST_FAILED_MESSAGE
     };
 
-    error_obj.insert(
-        "message".to_string(),
-        Value::String(compact_error_message(&message, 1800)),
-    );
+    json!({
+        "error": {
+            "message": message,
+            "type": "proxy_error",
+            "code": codex_proxy_error_code(error),
+            "param": Value::Null,
+        }
+    })
+}
 
-    if error_obj
-        .get("type")
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().is_empty())
-        .unwrap_or(true)
-    {
-        error_obj.insert("type".to_string(), Value::String("proxy_error".to_string()));
-    }
-
-    if error_obj.get("code").map(Value::is_null).unwrap_or(true) {
-        error_obj.insert(
-            "code".to_string(),
-            Value::String(codex_proxy_error_code(error).to_string()),
-        );
-    }
-
-    if !error_obj.contains_key("param") {
-        error_obj.insert("param".to_string(), Value::Null);
-    }
-
-    error_obj.insert(
-        "provider".to_string(),
-        Value::String(provider_name.to_string()),
-    );
-    error_obj.insert(
-        "model".to_string(),
-        Value::String(request_model.to_string()),
-    );
-    // 仅用于 Codex 本地路由；不要复用到 query 可能携带凭证的端点。
-    error_obj.insert("endpoint".to_string(), Value::String(endpoint.to_string()));
-    if let Some(status) = upstream_status {
-        error_obj.insert(
-            "upstream_status".to_string(),
-            Value::Number(serde_json::Number::from(status)),
-        );
-    }
-
-    body
+fn codex_upstream_error_json() -> Value {
+    json!({
+        "error": {
+            "message": PROVIDER_REQUEST_FAILED_MESSAGE,
+            "type": "upstream_error",
+            "code": "cc_switch_upstream_error",
+            "param": Value::Null,
+        }
+    })
 }
 
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
@@ -1141,21 +1080,6 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         | ProxyError::StopTimeout
         | ProxyError::StopFailed(_) => "cc_switch_proxy_error",
     }
-}
-
-fn compact_error_message(message: &str, max_chars: usize) -> String {
-    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_chars {
-        return normalized;
-    }
-
-    let truncated = normalized
-        .chars()
-        .take(max_chars)
-        .collect::<String>()
-        .trim_end()
-        .to_string();
-    format!("{truncated}…(truncated)")
 }
 
 // ============================================================================
@@ -1337,7 +1261,7 @@ fn log_forward_error(
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    match logger.log_error_with_context(
+    if let Err(e) = logger.log_error_with_context(
         request_id,
         ctx.provider.id.clone(),
         ctx.app_type_str.to_string(),
@@ -1349,8 +1273,7 @@ fn log_forward_error(
         Some(ctx.session_id.clone()),
         None,
     ) {
-        Ok(()) => schedule_tray_refresh_after_usage_log(state),
-        Err(e) => log::warn!("记录失败请求日志失败: {e}"),
+        log::warn!("记录失败请求日志失败: {e}");
     }
 }
 
@@ -1387,7 +1310,7 @@ async fn log_usage(
 
     let request_id = usage.dedup_request_id();
 
-    match logger.log_with_calculation(
+    if let Err(e) = logger.log_with_calculation(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -1403,37 +1326,21 @@ async fn log_usage(
         None, // provider_type
         is_streaming,
     ) {
-        Ok(()) => schedule_tray_refresh_after_usage_log(state),
-        Err(e) => log::warn!("[USG-001] 记录使用量失败: {e}"),
+        log::warn!("[USG-001] 记录使用量失败: {e}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_proxy_error_json, responses_sse_to_response_value,
-        should_use_claude_transform_streaming,
+        build_codex_redacted_upstream_error_response, codex_proxy_error_json,
+        responses_sse_to_response_value, should_use_claude_transform_streaming,
     };
     use crate::proxy::ProxyError;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    fn build_state(db: Arc<Database>) -> ProxyState {
-        ProxyState {
-            db: db.clone(),
-            config: Arc::new(RwLock::new(ProxyConfig::default())),
-            status: Arc::new(RwLock::new(ProxyStatus::default())),
-            start_time: Arc::new(RwLock::new(None)),
-            current_providers: Arc::new(RwLock::new(HashMap::new())),
-            provider_router: Arc::new(ProviderRouter::new(db.clone())),
-            gemini_shadow: Arc::new(GeminiShadowStore::default()),
-            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
-            app_handle: None,
-            tray_refresh_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
-        }
-    }
+    use axum::http::{HeaderMap, StatusCode};
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
 
     #[test]
     fn codex_oauth_responses_force_streaming_even_if_client_sent_false() {
@@ -1521,23 +1428,27 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
     }
 
     #[test]
-    fn codex_proxy_forward_error_includes_context_and_cause() {
+    fn codex_proxy_forward_error_redacts_context_and_cause() {
         let error = ProxyError::ForwardFailed("连接失败: dns lookup failed".to_string());
         let body = codex_proxy_error_json("DeepSeek", "deepseek-chat", "/responses", &error);
 
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("CC Switch local proxy failed"));
-        assert!(message.contains("DeepSeek"));
-        assert!(message.contains("deepseek-chat"));
-        assert!(message.contains("/responses"));
-        assert!(message.contains("dns lookup failed"));
+        assert_eq!(body["error"]["message"], "Provider request failed");
+        assert_eq!(body["error"]["type"], "proxy_error");
         assert_eq!(body["error"]["code"], "cc_switch_forward_failed");
-        assert_eq!(body["error"]["provider"], "DeepSeek");
-        assert_eq!(body["error"]["model"], "deepseek-chat");
+        assert!(body["error"]["param"].is_null());
+
+        let serialized = body.to_string();
+        assert!(!serialized.contains("DeepSeek"));
+        assert!(!serialized.contains("deepseek-chat"));
+        assert!(!serialized.contains("/responses"));
+        assert!(!serialized.contains("dns lookup failed"));
+        assert!(body["error"].get("provider").is_none());
+        assert!(body["error"].get("model").is_none());
+        assert!(body["error"].get("endpoint").is_none());
     }
 
     #[test]
-    fn codex_proxy_upstream_error_normalizes_nonstandard_body() {
+    fn codex_proxy_upstream_error_redacts_nonstandard_body() {
         let error = ProxyError::UpstreamError {
             status: 502,
             body: Some(
@@ -1547,15 +1458,24 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         };
         let body = codex_proxy_error_json("MiniMax", "abab6.5s", "/responses", &error);
 
-        let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("upstream_status: HTTP 502"));
-        assert!(message.contains("upstream gateway failed"));
-        assert_eq!(body["error"]["code"], 2013);
-        assert_eq!(body["error"]["upstream_status"], 502);
+        assert_eq!(body["error"]["message"], "Provider request failed");
+        assert_eq!(body["error"]["type"], "upstream_error");
+        assert_eq!(body["error"]["code"], "cc_switch_upstream_error");
+        assert!(body["error"]["param"].is_null());
+
+        let serialized = body.to_string();
+        assert!(!serialized.contains("upstream gateway failed"));
+        assert!(!serialized.contains("2013"));
+        assert!(!serialized.contains("MiniMax"));
+        assert!(!serialized.contains("abab6.5s"));
+        assert!(body["error"].get("upstream_status").is_none());
+        assert!(body["error"].get("provider").is_none());
+        assert!(body["error"].get("model").is_none());
+        assert!(body["error"].get("endpoint").is_none());
     }
 
     #[test]
-    fn codex_proxy_413_points_to_upstream_not_local_proxy() {
+    fn codex_proxy_413_redacts_upstream_html_body() {
         // 模拟上游渠道商 nginx 因 client_max_body_size 返回的 413 HTML 页面
         // （见 issue #666：长上下文 / 大图 / 大日志撞上游体积上限）
         let error = ProxyError::UpstreamError {
@@ -1569,20 +1489,69 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         };
         let body = codex_proxy_error_json("HCAI", "gpt-5.5", "/responses", &error);
 
-        let message = body["error"]["message"].as_str().unwrap();
-        // 不再误导成「本地代理失败」
-        assert!(!message.contains("CC Switch local proxy failed"));
-        // 明确指向上游 + 体积超限 + 可操作指引
-        assert!(message.contains("413"));
-        assert!(message.to_lowercase().contains("upstream"));
-        assert!(message.contains("/compact"));
-        // 关键：不把整段 nginx HTML 回显给用户
-        assert!(!message.contains("<html>"));
-        assert!(!message.contains("nginx/1.29.6"));
-        // 结构化字段仍然保留，便于程序化消费 / UI 呈现
-        assert_eq!(body["error"]["upstream_status"], 413);
-        assert_eq!(body["error"]["provider"], "HCAI");
-        assert_eq!(body["error"]["model"], "gpt-5.5");
-        assert_eq!(body["error"]["endpoint"], "/responses");
+        assert_eq!(body["error"]["message"], "Provider request failed");
+        assert_eq!(body["error"]["type"], "upstream_error");
+        assert_eq!(body["error"]["code"], "cc_switch_upstream_error");
+        assert!(body["error"]["param"].is_null());
+
+        let serialized = body.to_string();
+        assert!(!serialized.contains("<html>"));
+        assert!(!serialized.contains("nginx/1.29.6"));
+        assert!(!serialized.contains("HCAI"));
+        assert!(!serialized.contains("gpt-5.5"));
+        assert!(!serialized.contains("/responses"));
+        assert!(body["error"].get("upstream_status").is_none());
+        assert!(body["error"].get("provider").is_none());
+        assert!(body["error"].get("model").is_none());
+        assert!(body["error"].get("endpoint").is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_chat_upstream_error_response_preserves_status_and_redacts_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        headers.insert("content-length", "64".parse().unwrap());
+        headers.insert("x-request-id", "req_123".parse().unwrap());
+
+        let upstream_response = super::super::hyper_client::ProxyResponse::buffered(
+            StatusCode::UNAUTHORIZED,
+            headers,
+            Bytes::from_static(b"Unauthorized: sk-live-secret invalid for provider account"),
+        );
+
+        let response = build_codex_redacted_upstream_error_response(
+            upstream_response,
+            "Codex",
+            std::time::Duration::ZERO,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await
+        .expect("response should be built");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert!(response.headers().get("content-length").is_none());
+        assert_eq!(response.headers().get("x-request-id").unwrap(), "req_123");
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let body = serde_json::from_slice::<Value>(&body).expect("response body should be JSON");
+
+        assert_eq!(body["error"]["message"], "Provider request failed");
+        assert_eq!(body["error"]["type"], "upstream_error");
+        assert_eq!(body["error"]["code"], "cc_switch_upstream_error");
+        assert!(body["error"]["param"].is_null());
+
+        let serialized = body.to_string();
+        assert!(!serialized.contains("Unauthorized"));
+        assert!(!serialized.contains("sk-live-secret"));
+        assert!(!serialized.contains("provider account"));
     }
 }

@@ -6,6 +6,9 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
+pub(crate) const PROVIDER_REQUEST_FAILED_MESSAGE: &str = "Provider request failed";
+pub(crate) const PROXY_REQUEST_FAILED_MESSAGE: &str = "Proxy request failed";
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("服务器已在运行")]
@@ -76,92 +79,75 @@ pub enum ProxyError {
     Internal(String),
 }
 
+impl ProxyError {
+    pub(crate) fn is_provider_request_failure(&self) -> bool {
+        matches!(
+            self,
+            ProxyError::ForwardFailed(_)
+                | ProxyError::NoAvailableProvider
+                | ProxyError::AllProvidersCircuitOpen
+                | ProxyError::NoProvidersConfigured
+                | ProxyError::ProviderUnhealthy(_)
+                | ProxyError::UpstreamError { .. }
+                | ProxyError::MaxRetriesExceeded
+                | ProxyError::Timeout(_)
+                | ProxyError::StreamIdleTimeout(_)
+        )
+    }
+
+    pub(crate) fn redacted_client_message(&self) -> &'static str {
+        if self.is_provider_request_failure() {
+            PROVIDER_REQUEST_FAILED_MESSAGE
+        } else {
+            PROXY_REQUEST_FAILED_MESSAGE
+        }
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let (status, body) = match &self {
             ProxyError::UpstreamError {
                 status: upstream_status,
-                body: upstream_body,
+                body: _,
             } => {
                 let http_status =
                     StatusCode::from_u16(*upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
-
-                // 尝试解析上游响应体为 JSON，如果失败则包装为字符串
-                let error_body = if let Some(body_str) = upstream_body {
-                    if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body_str) {
-                        // 上游返回的是 JSON，直接透传
-                        json_body
-                    } else {
-                        // 上游返回的不是 JSON，包装为错误消息
-                        json!({
-                            "error": {
-                                "message": body_str,
-                                "type": "upstream_error",
-                            }
-                        })
+                let error_body = json!({
+                    "error": {
+                        "message": PROVIDER_REQUEST_FAILED_MESSAGE,
+                        "type": "upstream_error",
                     }
-                } else {
-                    json!({
-                        "error": {
-                            "message": format!("Upstream error (status {})", upstream_status),
-                            "type": "upstream_error",
-                        }
-                    })
-                };
-
+                });
                 (http_status, error_body)
             }
             _ => {
-                let (http_status, message) = match &self {
-                    ProxyError::AlreadyRunning => (StatusCode::CONFLICT, self.to_string()),
-                    ProxyError::NotRunning => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-                    ProxyError::BindFailed(_) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-                    }
-                    ProxyError::StopTimeout => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-                    }
-                    ProxyError::StopFailed(_) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-                    }
-                    ProxyError::ForwardFailed(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-                    ProxyError::NoAvailableProvider => {
-                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
-                    }
-                    ProxyError::AllProvidersCircuitOpen => {
-                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
-                    }
-                    ProxyError::NoProvidersConfigured => {
-                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
-                    }
-                    ProxyError::ProviderUnhealthy(_) => {
-                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
-                    }
-                    ProxyError::MaxRetriesExceeded => {
-                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
-                    }
-                    ProxyError::DatabaseError(_) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-                    }
-                    ProxyError::ConfigError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-                    ProxyError::TransformError(_) => {
-                        (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
-                    }
-                    ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-                    ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
-                    ProxyError::StreamIdleTimeout(_) => {
-                        (StatusCode::GATEWAY_TIMEOUT, self.to_string())
-                    }
-                    ProxyError::AuthError(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
-                    ProxyError::Internal(_) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-                    }
+                let http_status = match &self {
+                    ProxyError::AlreadyRunning => StatusCode::CONFLICT,
+                    ProxyError::NotRunning => StatusCode::SERVICE_UNAVAILABLE,
+                    ProxyError::BindFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    ProxyError::StopTimeout => StatusCode::INTERNAL_SERVER_ERROR,
+                    ProxyError::StopFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    ProxyError::ForwardFailed(_) => StatusCode::BAD_GATEWAY,
+                    ProxyError::NoAvailableProvider => StatusCode::SERVICE_UNAVAILABLE,
+                    ProxyError::AllProvidersCircuitOpen => StatusCode::SERVICE_UNAVAILABLE,
+                    ProxyError::NoProvidersConfigured => StatusCode::SERVICE_UNAVAILABLE,
+                    ProxyError::ProviderUnhealthy(_) => StatusCode::SERVICE_UNAVAILABLE,
+                    ProxyError::MaxRetriesExceeded => StatusCode::SERVICE_UNAVAILABLE,
+                    ProxyError::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    ProxyError::ConfigError(_) => StatusCode::BAD_REQUEST,
+                    ProxyError::TransformError(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+                    ProxyError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+                    ProxyError::StreamIdleTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+                    ProxyError::AuthError(_) => StatusCode::UNAUTHORIZED,
+                    ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     ProxyError::UpstreamError { .. } => unreachable!(),
                 };
 
                 let error_body = json!({
                     "error": {
-                        "message": message,
+                        "message": self.redacted_client_message(),
                         "type": "proxy_error",
                     }
                 });
@@ -202,5 +188,63 @@ pub fn categorize_error(error: &reqwest::Error) -> ErrorCategory {
         }
     } else {
         ErrorCategory::Retryable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+
+    async fn proxy_error_response_json(error: ProxyError) -> (StatusCode, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let body = serde_json::from_slice::<Value>(&body).expect("response body should be JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn upstream_error_response_preserves_status_and_redacts_provider_body() {
+        let (status, body) = proxy_error_response_json(ProxyError::UpstreamError {
+            status: 429,
+            body: Some(
+                r#"{"error":{"message":"quota exhausted for sk-live-secret","code":"rate_limit"}}"#
+                    .to_string(),
+            ),
+        })
+        .await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["message"], "Provider request failed");
+        assert_eq!(body["error"]["type"], "upstream_error");
+
+        let serialized = body.to_string();
+        assert!(!serialized.contains("quota exhausted"));
+        assert!(!serialized.contains("sk-live-secret"));
+        assert!(!serialized.contains("rate_limit"));
+    }
+
+    #[tokio::test]
+    async fn provider_forward_failure_response_preserves_status_and_redacts_internal_message() {
+        let (status, body) = proxy_error_response_json(ProxyError::ForwardFailed(
+            "连接失败: dns lookup failed for api.provider.example".to_string(),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["message"], "Provider request failed");
+        assert_eq!(body["error"]["type"], "proxy_error");
+
+        let serialized = body.to_string();
+        assert!(!serialized.contains("dns lookup failed"));
+        assert!(!serialized.contains("api.provider.example"));
     }
 }

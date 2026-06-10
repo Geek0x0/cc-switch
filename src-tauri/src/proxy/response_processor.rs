@@ -3,21 +3,23 @@
 //! 统一处理流式和非流式 API 响应
 
 use super::{
+    error::PROVIDER_REQUEST_FAILED_MESSAGE,
     forwarder::ActiveConnectionGuard,
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::ProxyResponse,
+    response_guard,
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
     usage::parser::TokenUsage,
     ProxyError,
 };
 use crate::database::PRICING_SOURCE_REQUEST;
-use axum::http::{header::HeaderMap, HeaderName};
+use axum::http::{header::HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{Stream, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     io::Read,
     sync::{
@@ -211,14 +213,35 @@ pub async fn handle_streaming(
         builder = builder.header(key, value);
     }
 
-    // 创建字节流
-    let stream = response.bytes_stream();
+    // 获取流式超时配置
+    let timeout_config = ctx.streaming_timeout_config();
+
+    let (stream, passthrough_connection_guard): (
+        std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        Option<ActiveConnectionGuard>,
+    ) = if parser_config.app_type_str == "codex" {
+        let _conn_guard = connection_guard;
+        let body_bytes =
+            match collect_streaming_response_body(response, ctx.tag, timeout_config).await {
+                Ok(body_bytes) => body_bytes,
+                Err(error) => return error.into_response(),
+            };
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        if response_guard::responses_sse_has_blocked_content(&body_text) {
+            log::warn!("[{}] 拦截包含被屏蔽内容的 Responses 流式成功响应", ctx.tag);
+            return redacted_provider_failure_response(ctx.app_type_str);
+        }
+
+        (
+            Box::pin(futures::stream::once(async move { Ok(body_bytes) })),
+            None,
+        )
+    } else {
+        (Box::pin(response.bytes_stream()), connection_guard)
+    };
 
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
-
-    // 获取流式超时配置
-    let timeout_config = ctx.streaming_timeout_config();
 
     // 创建带日志和超时的透传流
     let logged_stream = create_logged_passthrough_stream(
@@ -226,7 +249,7 @@ pub async fn handle_streaming(
         ctx.tag,
         usage_collector,
         timeout_config,
-        connection_guard,
+        passthrough_connection_guard,
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -259,6 +282,18 @@ pub async fn handle_non_streaming(
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     strip_hop_by_hop_response_headers(&mut response_headers);
 
+    let parsed_json = serde_json::from_slice::<Value>(&body_bytes).ok();
+    if parsed_json
+        .as_ref()
+        .is_some_and(response_guard::responses_success_has_blocked_content)
+    {
+        log::warn!(
+            "[{}] 拦截包含被屏蔽内容的 Responses 非流式成功响应",
+            ctx.tag
+        );
+        return Ok(redacted_provider_failure_response(ctx.app_type_str));
+    }
+
     log::debug!(
         "[{}] 上游响应体内容: {}",
         ctx.tag,
@@ -267,7 +302,7 @@ pub async fn handle_non_streaming(
 
     // 解析并记录使用量。关闭 usage logging 时直接跳过，避免非流式响应整包 JSON parse。
     if usage_logging_enabled(state) {
-        if let Ok(json_value) = serde_json::from_slice::<Value>(&body_bytes) {
+        if let Some(json_value) = parsed_json.as_ref() {
             // 解析使用量
             if let Some(usage) = (parser_config.response_parser)(&json_value) {
                 // 优先使用 usage 中解析出的模型名称，其次使用响应中的 model 字段，最后回退到请求模型
@@ -355,6 +390,102 @@ pub async fn process_response(
         Ok(handle_streaming(response, ctx, state, parser_config, connection_guard).await)
     } else {
         handle_non_streaming(response, ctx, state, parser_config, connection_guard).await
+    }
+}
+
+pub(crate) async fn collect_streaming_response_body(
+    response: ProxyResponse,
+    tag: &str,
+    timeout_config: StreamingTimeoutConfig,
+) -> Result<Bytes, ProxyError> {
+    collect_streaming_body_from_stream(response.bytes_stream(), tag, timeout_config).await
+}
+
+pub(crate) async fn collect_streaming_body_from_stream(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    tag: &str,
+    timeout_config: StreamingTimeoutConfig,
+) -> Result<Bytes, ProxyError> {
+    let mut body = BytesMut::new();
+    let mut is_first_chunk = true;
+    let first_byte_timeout = (timeout_config.first_byte_timeout > 0)
+        .then(|| Duration::from_secs(timeout_config.first_byte_timeout));
+    let idle_timeout =
+        (timeout_config.idle_timeout > 0).then(|| Duration::from_secs(timeout_config.idle_timeout));
+    let mut stream = Box::pin(stream);
+
+    loop {
+        let timeout = if is_first_chunk {
+            first_byte_timeout
+        } else {
+            idle_timeout
+        };
+
+        let chunk = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    let timeout_type = if is_first_chunk {
+                        "首字节"
+                    } else {
+                        "静默期"
+                    };
+                    ProxyError::Timeout(format!(
+                        "流式响应{timeout_type}超时: {}s",
+                        timeout.as_secs()
+                    ))
+                })?,
+            None => stream.next().await,
+        };
+
+        let Some(chunk) = chunk else {
+            break;
+        };
+
+        let chunk = chunk.map_err(|error| {
+            ProxyError::ForwardFailed(format!("Failed to read streaming response body: {error}"))
+        })?;
+        if is_first_chunk {
+            log::debug!("[{tag}] 已接收上游流式首包: bytes={}", chunk.len());
+            is_first_chunk = false;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body.freeze())
+}
+
+pub(crate) fn redacted_provider_failure_response(app_type_str: &str) -> Response {
+    let body = if app_type_str == "codex" {
+        json!({
+            "error": {
+                "message": PROVIDER_REQUEST_FAILED_MESSAGE,
+                "type": "upstream_error",
+                "code": "cc_switch_upstream_error",
+                "param": Value::Null,
+            }
+        })
+    } else {
+        json!({
+            "error": {
+                "message": PROVIDER_REQUEST_FAILED_MESSAGE,
+                "type": "upstream_error",
+            }
+        })
+    };
+
+    match axum::response::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&body).unwrap_or_default(),
+        )) {
+        Ok(response) => response,
+        Err(error) => ProxyError::Internal(format!("Failed to build redacted response: {error}"))
+            .into_response(),
     }
 }
 
@@ -654,7 +785,7 @@ async fn log_usage_internal(
         usage.cache_creation_tokens
     );
 
-    match logger.log_with_calculation(
+    if let Err(e) = logger.log_with_calculation(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -670,19 +801,7 @@ async fn log_usage_internal(
         None, // provider_type
         is_streaming,
     ) {
-        Ok(()) => schedule_tray_refresh_after_usage_log(state),
-        Err(e) => log::warn!("[USG-001] 记录使用量失败: {e}"),
-    }
-}
-
-pub(crate) fn schedule_tray_refresh_after_usage_log(state: &ProxyState) {
-    #[cfg(test)]
-    state
-        .tray_refresh_count
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-    if let Some(app_handle) = &state.app_handle {
-        crate::tray::schedule_tray_refresh(app_handle);
+        log::warn!("[USG-001] 记录使用量失败: {e}");
     }
 }
 
@@ -956,7 +1075,6 @@ mod tests {
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle: None,
-            tray_refresh_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }
     }
@@ -1114,48 +1232,6 @@ mod tests {
         assert_eq!(
             Decimal::from_str(&total_cost).unwrap(),
             Decimal::from_str("1.5").unwrap()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_log_usage_schedules_tray_refresh_after_successful_insert() -> Result<(), AppError>
-    {
-        let db = Arc::new(Database::memory()?);
-        let app_type = "claude";
-        seed_pricing(&db)?;
-        insert_provider(&db, "provider-tray", app_type, ProviderMeta::default())?;
-
-        let state = build_state(db);
-        let usage = TokenUsage {
-            input_tokens: 10,
-            output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            model: None,
-            message_id: None,
-        };
-
-        log_usage_internal(
-            &state,
-            "provider-tray",
-            app_type,
-            "resp-model",
-            "resp-model",
-            usage,
-            10,
-            None,
-            false,
-            200,
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            state
-                .tray_refresh_count
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
         );
         Ok(())
     }
